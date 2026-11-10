@@ -7,6 +7,8 @@ Coordinates are 0-based SAMPLE INDICES of patch centres along the SEG-Y's sorted
 (NCS.inference.tiling.compute_densified_axis: coord = phase_offset + patch_size//2 + k*patch_size; with patch 16 and
 densify d the step is 16/d and the first centre is 8). So feature coord c on the inline axis is ilines[c] (segyio's
 sorted inline numbers), and on the time axis it is samples[c].
+The number of patches per phase is rounded UP, so the last few centres can lie beyond the volume (e.g. up to 260 for
+256 inlines at densify 4). Those patches mostly see padding: crop_to_volume() drops them before analysis.
 
 Everything here works on the feature grid in chunks (the cube can be many GB) and maps results onto the seismic grid
 (inline, crossline, time) used by rgt_lfm.read_segy_cube: linear interpolation for continuous values, nearest
@@ -29,15 +31,33 @@ def axis_maps(coords, n):
     return frac, nearest
 
 
+def crop_to_volume(ds, NI, NX, NT, patch_size=16):
+    """
+    Drop patch centres that fall outside the seismic (NCS rounds the patch count up, so the last few centres sit in
+    padding). Raises if the overshoot is bigger than one patch, which would mean the cube and the SEG-Y don't match.
+    Returns (cropped dataset, dict of how many centres were dropped per axis).
+    """
+    dropped, sel = {}, {}
+    for ax, n in (("inline", NI), ("xline", NX), ("time_depth", NT)):
+        c = np.asarray(ds[ax].values)
+        if c.max() > n - 1 + patch_size:
+            raise ValueError(f"feature {ax} centres reach sample index {c.max()}, more than a patch beyond the seismic "
+                             f"axis (length {n}): are the feature cube and the SEG-Y from the same volume?")
+        keep = c <= n - 1
+        dropped[ax] = int((~keep).sum())
+        sel[ax] = np.nonzero(keep)[0]
+    return ds.isel(**sel), dropped
+
+
 def describe_registration(ds, ilines, xlines, samples):
-    """Human-readable check of how the feature grid sits on the seismic grid."""
+    """Human-readable check of how the feature grid sits on the seismic grid (run on a cropped dataset)."""
     out = []
     for name, ax, labels, unit in (("inline", "inline", ilines, ""), ("xline", "xline", xlines, ""),
                                    ("time_depth", "time_depth", samples, " ms")):
         c = np.asarray(ds[ax].values)
         if c.max() >= len(labels):
-            raise ValueError(f"feature {name} coordinates reach {c.max()}, beyond the seismic axis length {len(labels)}: "
-                             "are the feature cube and SEG-Y from the same volume?")
+            raise ValueError(f"feature {name} centre {c.max()} is outside the seismic (length {len(labels)}): "
+                             "crop with crop_to_volume() first")
         step = np.unique(np.diff(c))
         out.append(f"{name:10s}: {len(c)} positions, sample index {c[0]}–{c[-1]} (step {step.tolist()}) "
                    f"= {labels[c[0]]:g}–{labels[c[-1]]:g}{unit} of {labels[0]:g}–{labels[-1]:g}{unit}")
@@ -143,3 +163,30 @@ def node_from_links(sim_il, sim_xl):
     w[:-1] = np.minimum(w[:-1], sim_il); w[1:] = np.minimum(w[1:], sim_il)
     w[:, :-1] = np.minimum(w[:, :-1], sim_xl); w[:, 1:] = np.minimum(w[:, 1:], sim_xl)
     return w
+
+
+# ---------------------------------------------------------------------------
+# Finding and opening feature cubes; striping check
+# ---------------------------------------------------------------------------
+def zarr_groups(path):
+    """Group names inside a Zarr store (v2 or v3 layout)."""
+    import os
+    return sorted(d for d in os.listdir(path) if os.path.isdir(os.path.join(path, d))
+                  and any(os.path.exists(os.path.join(path, d, m)) for m in ("zarr.json", ".zgroup", ".zattrs")))
+
+
+def open_cube(path, group=None):
+    """Open an NCS feature cube; picks the only group if `group` is None. Returns (dataset, group name)."""
+    import xarray as xr
+    groups = zarr_groups(path)
+    g = group or (groups[0] if len(groups) == 1 else "dir0")
+    if groups and g not in groups:
+        raise ValueError(f"group {g!r} not in {path}; available: {groups}")
+    return xr.open_zarr(path, group=g), g
+
+
+def striping(sim_il, sim_xl):
+    """Mean neighbour similarity across inlines vs across crosslines. For a 2D inline (dir0) model, much lower
+    similarity between neighbouring INLINES than between neighbouring crosslines indicates section-to-section
+    inconsistency (striping on time slices) rather than geology."""
+    return float(np.mean(sim_il)), float(np.mean(sim_xl))

@@ -1,0 +1,10 @@
+# For local/rgt_lfm_cpu.py. Python 3.10–3.12 recommended (segyio wheels).
+# CPU-only PyTorch first:  pip install torch --index-url https://download.pytorch.org/whl/cpu
+# then:                    pip install -r local/requirements_cpu.txt
+numpy
+scipy
+pandas
+matplotlib
+segyio
+lasio
+psutil
